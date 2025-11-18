@@ -5,4 +5,7 @@ raw_data/
 svm_data/
 models/
 *.ipynb
-check_contextual_sparsity_ans.py 
+check_contextual_sparsitygit.py 
+.venv/
+.env
+*.log
