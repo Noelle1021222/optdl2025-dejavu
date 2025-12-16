@@ -6,25 +6,28 @@ import os
 import json
 import random
 import numpy as np
-
+from tqdm import tqdm
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-def apply_topk_mask(tensor, ratio=0.5): #ratio:keep 50% 的 neuron
+# --- 1. Masking 輔助函式 ---
+
+def apply_topk_mask(tensor, ratio=0.5): 
+    # ratio: keep ratio
     k = max(1, int(tensor.size(-1) * ratio))
     score = tensor.abs()
-    topk_idx = torch.topk(score, k, dim=-1).indices #get top-k 個neuron
+    topk_idx = torch.topk(score, k, dim=-1).indices 
     mask = torch.zeros_like(tensor)
-    mask.scatter_(-1, topk_idx, 1.0) #top-k positions set to 1
+    mask.scatter_(-1, topk_idx, 1.0) 
     return tensor * mask
 
 def apply_random_mask(tensor, ratio=0.5):
+    # ratio: keep ratio
     mask = (torch.rand_like(tensor) < ratio).float()
     return tensor * mask
 
-def compute_masked_ppl(model_name="distilgpt2", ratio=0.5, mode="topk",
-                       log_list=None, num_samples=200, max_length=256, batch_size=8):
-
+def prepare_environment(model_name="distilgpt2", num_samples=200, max_length=256):
+    print("Loading model and dataset... (This happens only once)")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
 
@@ -50,17 +53,21 @@ def compute_masked_ppl(model_name="distilgpt2", ratio=0.5, mode="topk",
         padding=True,
         return_tensors="pt",
     )
+    
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    
+    print(f"[Ready] Device: {device}, Samples: {len(sample_list)}")
+    return model, input_ids, attention_mask, device
 
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded["attention_mask"]
+def compute_masked_ppl(model, input_ids, attention_mask, 
+                       ratio=0.5, mode="topk", target_layers=None, 
+                       log_list=None, batch_size=8):
 
-    token_lengths = attention_mask.sum(dim=1).tolist()
-    avg_tokens = sum(token_lengths) / len(token_lengths)
-    print(f"[Dataset Stats] Number of samples = {len(sample_list)}")
-    print(f"[Dataset Stats] Average tokens per sample = {avg_tokens:.2f}")
-
-    input_ids = input_ids.to(device)
-    attention_mask = attention_mask.to(device)
+    if target_layers is None:
+        target_layers = [0]
+    if isinstance(target_layers, int):
+        target_layers = [target_layers]
 
     def hook_fn(module, input, output):
         if mode == "topk":
@@ -69,22 +76,31 @@ def compute_masked_ppl(model_name="distilgpt2", ratio=0.5, mode="topk",
             return apply_random_mask(output, ratio)
         return output
 
-    #handle = model.transformer.h[0].mlp.c_fc.register_forward_hook(hook_fn)
-    handle = model.transformer.h[0].mlp.act.register_forward_hook(hook_fn)
+    handles = []
+    for layer_idx in target_layers:
+        if 0 <= layer_idx < len(model.transformer.h):
+            #activation (GELU 後)
+            h = model.transformer.h[layer_idx].mlp.act.register_forward_hook(hook_fn)
+            handles.append(h)
+        else:
+            print(f"Warning: Layer {layer_idx} does not exist.")
+
     total_nll = 0.0      
     total_tokens = 0    
-    total_correct = 0  
+    total_correct = 0   
     total_valid = 0   
 
+    # 開始評估
     with torch.no_grad():
         num_samples = input_ids.size(0)
+        
         for start in range(0, num_samples, batch_size):
             end = min(start + batch_size, num_samples)
             batch_input_ids = input_ids[start:end]
             batch_attention_mask = attention_mask[start:end]
 
             labels = batch_input_ids.clone()
-            labels[batch_attention_mask == 0] = -100  #ignore pad
+            labels[batch_attention_mask == 0] = -100 
 
             outputs = model(
                 input_ids=batch_input_ids,
@@ -94,47 +110,41 @@ def compute_masked_ppl(model_name="distilgpt2", ratio=0.5, mode="topk",
             loss = outputs.loss  
             logits = outputs.logits
 
-            # PPL
-            valid_mask = labels != -100
-            n_tokens = valid_mask.sum().item() #實際預測的token數量
-            #算PPL
-            total_nll += loss.item() * n_tokens 
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            
+            # 2. Valid Mask
+            valid_mask = shift_labels != -100
+            n_tokens = valid_mask.sum().item()
+            
+            total_nll += loss.item() * n_tokens
             total_tokens += n_tokens
 
-            #把 Logits 的最後一個丟掉
-            shift_logits = logits[..., :-1, :].contiguous()
-            #把 Labels 的第一個丟掉
-            shift_labels = labels[..., 1:].contiguous()
-
-            #重新算 mask
-            shift_valid_mask = shift_labels != -100
-            num_predictions = shift_valid_mask.sum().item()
             preds = torch.argmax(shift_logits, dim=-1)
-            correct = (preds[shift_valid_mask] == shift_labels[shift_valid_mask]).sum().item()
+            correct = (preds[valid_mask] == shift_labels[valid_mask]).sum().item()
             total_correct += correct
-            total_valid += num_predictions
+            total_valid += n_tokens
 
-    handle.remove()
+    # 移除 Hooks
+    for h in handles:
+        h.remove()
 
-    
     avg_nll = total_nll / total_tokens if total_tokens > 0 else float("inf")
     ppl = math.exp(avg_nll)
     acc = total_correct / total_valid if total_valid > 0 else 0.0
 
-    msg = f"{mode.upper()}-{ratio:.2f} => PPL: {ppl:.2f}, ACC: {acc:.4f}"
+    msg = f"Layer {target_layers} | {mode.upper()}-{ratio:.2f} => PPL: {ppl:.2f}, ACC: {acc:.4f}"
     print(msg)
 
     if log_list is not None:
         log_list.append({
             "mode": mode,
             "ratio": ratio,
+            "target_layers": target_layers, 
             "ppl": ppl,
             "acc": acc,
-            "num_samples": num_samples,
-            "avg_tokens": avg_tokens,
-            "max_length": max_length,
+            "num_samples": num_samples
         })
-
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -146,18 +156,31 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 if __name__ == "__main__":
-    set_seed(50)
-
+    set_seed(50) 
+    model, input_ids, attention_mask, device = prepare_environment()
+    
     results = []
-    ratios = [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0]
+    test_ratio = 0.5   
+    num_layers = 6     
+    
+    print("\n=== Step 1: Baseline (No Masking) ===")
+    # Ratio 1.0 = No Masking
+    compute_masked_ppl(model, input_ids, attention_mask, ratio=1.0, mode="topk", target_layers=[0], log_list=results)
 
-    for ratio in ratios:
-        compute_masked_ppl(ratio=ratio, mode="topk", log_list=results)
-        compute_masked_ppl(ratio=ratio, mode="random", log_list=results)
+    print(f"\n=== Step 2: Layer-wise Sensitivity Scan (Ratio={test_ratio}) ===")
+    for layer_idx in range(num_layers):
+        print(f"\n--- Testing Layer {layer_idx} ---")
+        
+        # 1. Top-K
+        compute_masked_ppl(model, input_ids, attention_mask, 
+                           ratio=test_ratio, mode="topk", target_layers=[layer_idx], log_list=results)
+        
+        # 2. Random-K
+        compute_masked_ppl(model, input_ids, attention_mask, 
+                           ratio=test_ratio, mode="random", target_layers=[layer_idx], log_list=results)
 
-
-    with open("masked_results.json", "w") as f:
+    # 存檔
+    output_filename = "layer_sensitivity_results.json"
+    with open(output_filename, "w") as f:
         json.dump(results, f, indent=2)
-    print("\nsaved to masked_results.json")
-
-
+    print(f"\nSaved results to {output_filename}")
